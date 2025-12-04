@@ -1,0 +1,22 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Temp files
+*.tmp
+*.temp
+
+# Downloads (don't commit video files)
+downloads/
+*.mp4
+*.webm
+*.mkv

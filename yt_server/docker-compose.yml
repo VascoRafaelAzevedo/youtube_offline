@@ -1,0 +1,28 @@
+services:
+  yt-server:
+    build: .
+    container_name: offline-youtube-server
+    ports:
+      - "8765:8765"
+    environment:
+      - PORT=8765
+      - API_KEY=${API_KEY:-offline_yt_secret_2025}
+    volumes:
+      # Persist downloaded videos (optional - server streams to client anyway)
+      - yt_downloads:/downloads
+      # Temp directory for processing
+      - yt_temp:/tmp/yt_server_temp
+    restart: unless-stopped
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  yt_downloads:
+  yt_temp:
