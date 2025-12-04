@@ -320,7 +320,13 @@ def download_video(video_id: str, format_string: str, quality_name: str) -> dict
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     output_template = str(TEMP_DIR / f"{video_id}_%(title)s.%(ext)s")
     
-    # Build yt-dlp command
+    # Pre-download sleep to avoid YouTube bot detection
+    # This is critical - YouTube blocks rapid consecutive requests
+    pre_sleep = random.uniform(8, 12)
+    print(f"[ANTI-BOT] Pre-download sleep: {pre_sleep:.1f}s")
+    time.sleep(pre_sleep)
+    
+    # Build yt-dlp command with aggressive anti-bot settings
     cmd = [
         YTDLP_PATH,
         "-f", format_string,
@@ -330,11 +336,13 @@ def download_video(video_id: str, format_string: str, quality_name: str) -> dict
         "--newline",
         "--no-continue",
         "--no-part",
-        "--retries", "3",
-        "--fragment-retries", "3",
-        "--sleep-requests", "1",  # Sleep between requests
-        "--sleep-interval", "2",  # Sleep between downloads
-        "--max-sleep-interval", "5",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "--extractor-retries", "3",
+        "--sleep-requests", "1.5",      # Sleep between HTTP requests
+        "--sleep-interval", "5",        # Min sleep between downloads
+        "--max-sleep-interval", "10",   # Max sleep between downloads
+        "--sleep-subtitles", "2",       # Sleep before subtitle download
         "--progress-template", "download:%(progress._percent_str)s of %(progress._total_bytes_str)s at %(progress._speed_str)s ETA %(progress._eta_str)s",
     ]
     
