@@ -123,9 +123,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
       // Seek to last position if resuming
       if (widget.video.hasResumePosition) {
-        await _player.seek(
-          Duration(seconds: widget.video.lastPositionSeconds),
-        );
+        await _player.seek(Duration(seconds: widget.video.lastPositionSeconds));
       }
 
       await _player.play();
@@ -196,9 +194,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _seekBackward([int seconds = 10]) {
     final newPosition = _player.state.position - Duration(seconds: seconds);
-    _player.seek(
-      newPosition < Duration.zero ? Duration.zero : newPosition,
-    );
+    _player.seek(newPosition < Duration.zero ? Duration.zero : newPosition);
 
     setState(() {
       _seekSeconds += seconds;
@@ -266,8 +262,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       speed == 1.0 ? 'Normal' : '${speed}x',
                       style: TextStyle(
                         color: isSelected ? Colors.blue : Colors.white,
-                        fontWeight:
-                            isSelected ? FontWeight.bold : FontWeight.normal,
+                        fontWeight: isSelected
+                            ? FontWeight.bold
+                            : FontWeight.normal,
                       ),
                     ),
                     onTap: () {
@@ -296,17 +293,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   @override
   void dispose() {
     _hideControlsTimer?.cancel();
-    
+
     // Save final position
     if (_isInitialized) {
       _savePosition(_player.state.position.inSeconds);
     }
-    
+
     // Cancel subscriptions
     for (final sub in _subscriptions) {
       sub.cancel();
     }
-    
+
     // Dispose player
     _player.dispose();
 
@@ -476,7 +473,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               children: [
                 // Top bar
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   child: Row(
                     children: [
                       IconButton(
@@ -561,7 +561,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                         builder: (context, bufferSnapshot) {
                           final buffered = bufferSnapshot.data ?? Duration.zero;
                           final bufferedFraction = duration.inMilliseconds > 0
-                              ? buffered.inMilliseconds / duration.inMilliseconds
+                              ? buffered.inMilliseconds /
+                                    duration.inMilliseconds
                               : 0.0;
 
                           return SliderTheme(
@@ -573,20 +574,28 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                               overlayShape: const RoundSliderOverlayShape(
                                 overlayRadius: 16,
                               ),
-                              activeTrackColor:
-                                  Theme.of(context).colorScheme.primary,
+                              activeTrackColor: Theme.of(
+                                context,
+                              ).colorScheme.primary,
                               inactiveTrackColor: Colors.white30,
                               thumbColor: Theme.of(context).colorScheme.primary,
                               secondaryActiveTrackColor: Colors.white54,
                             ),
                             child: Slider(
-                              value: position.inMilliseconds
-                                  .toDouble()
-                                  .clamp(0.0, duration.inMilliseconds.toDouble()),
-                              max: duration.inMilliseconds.toDouble().clamp(1.0, double.infinity),
+                              value: position.inMilliseconds.toDouble().clamp(
+                                0.0,
+                                duration.inMilliseconds.toDouble(),
+                              ),
+                              max: duration.inMilliseconds.toDouble().clamp(
+                                1.0,
+                                double.infinity,
+                              ),
                               secondaryTrackValue:
                                   (bufferedFraction * duration.inMilliseconds)
-                                      .clamp(0.0, duration.inMilliseconds.toDouble()),
+                                      .clamp(
+                                        0.0,
+                                        duration.inMilliseconds.toDouble(),
+                                      ),
                               onChanged: (value) {
                                 _player.seek(
                                   Duration(milliseconds: value.toInt()),
@@ -671,10 +680,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             const SizedBox(height: 16),
             Text(
               'Error loading video',
-              style: Theme.of(context)
-                  .textTheme
-                  .headlineSmall
-                  ?.copyWith(color: Colors.white),
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(color: Colors.white),
             ),
             const SizedBox(height: 8),
             Text(
@@ -714,14 +722,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (video != null) {
       if (video.watched) {
         await ref.read(syncProvider.notifier).markAsUnwatched(video);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Marked as unwatched')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Marked as unwatched')));
       } else {
         await ref.read(syncProvider.notifier).markAsWatched(video);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Marked as watched')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Marked as watched')));
       }
       setState(() {});
     }

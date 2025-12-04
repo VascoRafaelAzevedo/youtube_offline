@@ -306,6 +306,32 @@ class DownloadService {
         print(
           'DownloadService: ERROR - Server returned ${streamedResponse.statusCode}: $body',
         );
+
+        // Parse error response
+        Map<String, dynamic>? errorData;
+        try {
+          errorData = json.decode(body) as Map<String, dynamic>?;
+        } catch (_) {}
+
+        // Check for specific error types
+        if (streamedResponse.statusCode == 429) {
+          // Video blocked or rate limited
+          final retryAfter = errorData?['retry_after'] as int? ?? 60;
+          final failCount = errorData?['fail_count'] as int? ?? 0;
+          print(
+            'DownloadService: Video blocked (fails: $failCount), retry after ${retryAfter}s',
+          );
+          onProgress?.call(videoId, 0.0, DownloadStatus.failed);
+          return null;
+        } else if (streamedResponse.statusCode == 503) {
+          // Bot detection - server needs cooldown
+          print(
+            'DownloadService: Bot detection on server, waiting for cooldown',
+          );
+          onProgress?.call(videoId, 0.0, DownloadStatus.failed);
+          return null;
+        }
+
         onProgress?.call(videoId, 0.0, DownloadStatus.failed);
         return null;
       }
@@ -429,10 +455,33 @@ class DownloadService {
       }
 
       if (attempt > 0) {
-        print('DownloadService: Retry attempt $attempt/$maxRetries after ${delay}s delay');
-        onStatusUpdate?.call(video.videoId, 'Tentativa $attempt de $maxRetries (aguardando ${delay}s)...');
+        print(
+          'DownloadService: Retry attempt $attempt/$maxRetries after ${delay}s delay',
+        );
+        onStatusUpdate?.call(
+          video.videoId,
+          'Tentativa $attempt de $maxRetries (aguardando ${delay}s)...',
+        );
         await Future.delayed(Duration(seconds: delay));
-        delay = (delay * 2).clamp(5, 60); // Exponential backoff, max 60s
+        delay = (delay * 2).clamp(5, 90); // Exponential backoff, max 90s
+      }
+
+      // Check if video is blocked before attempting
+      final preStatus = await getServerStatus(video.videoId);
+      if (preStatus != null) {
+        final status = preStatus['status'] as Map<String, dynamic>?;
+        if (status != null && status['status'] == 'blocked') {
+          final retryAfter = status['retry_after'] as int? ?? 60;
+          print(
+            'DownloadService: Video blocked on server, waiting ${retryAfter}s',
+          );
+          onStatusUpdate?.call(
+            video.videoId,
+            'Servidor bloqueado, aguardando ${retryAfter}s...',
+          );
+          await Future.delayed(Duration(seconds: retryAfter));
+          continue; // Retry after waiting
+        }
       }
 
       final result = await downloadVideo(
@@ -445,22 +494,54 @@ class DownloadService {
         return result;
       }
 
-      // Check if video is queued on server (not a real failure)
+      // Check server status to understand the failure
       final status = await getServerStatus(video.videoId);
       if (status != null) {
-        final serverStatus = status['status'] as String? ?? '';
-        if (serverStatus == 'queued' || serverStatus == 'downloading') {
-          print('DownloadService: Video is queued/downloading on server, waiting...');
-          onStatusUpdate?.call(video.videoId, 'Na fila do servidor...');
-          // Wait for server queue
-          final queueResult = await _waitForServerQueue(
-            video,
-            onProgress: onProgress,
-            onStatusUpdate: onStatusUpdate,
-            quality: quality,
-          );
-          if (queueResult != null) {
-            return queueResult;
+        final statusData = status['status'];
+
+        if (statusData is Map<String, dynamic>) {
+          final serverStatus = statusData['status'] as String? ?? '';
+
+          if (serverStatus == 'queued' || serverStatus == 'downloading') {
+            print(
+              'DownloadService: Video is queued/downloading on server, waiting...',
+            );
+            onStatusUpdate?.call(video.videoId, 'Na fila do servidor...');
+            final queueResult = await _waitForServerQueue(
+              video,
+              onProgress: onProgress,
+              onStatusUpdate: onStatusUpdate,
+              quality: quality,
+            );
+            if (queueResult != null) {
+              return queueResult;
+            }
+          } else if (serverStatus == 'blocked') {
+            final retryAfter = statusData['retry_after'] as int? ?? 60;
+            print('DownloadService: Video blocked, waiting ${retryAfter}s');
+            onStatusUpdate?.call(
+              video.videoId,
+              'Vídeo bloqueado, aguardando ${retryAfter}s...',
+            );
+            await Future.delayed(Duration(seconds: retryAfter));
+            // Don't count as retry if we're waiting for block to expire
+            continue;
+          }
+        } else if (statusData is String) {
+          if (statusData == 'queued' || statusData == 'downloading') {
+            print(
+              'DownloadService: Video is queued/downloading on server, waiting...',
+            );
+            onStatusUpdate?.call(video.videoId, 'Na fila do servidor...');
+            final queueResult = await _waitForServerQueue(
+              video,
+              onProgress: onProgress,
+              onStatusUpdate: onStatusUpdate,
+              quality: quality,
+            );
+            if (queueResult != null) {
+              return queueResult;
+            }
           }
         }
       }
@@ -498,15 +579,24 @@ class DownloadService {
       final serverStatus = status['status'] as String? ?? '';
       final queuePosition = status['queue_position'] as int? ?? 0;
 
-      print('DownloadService: Queue poll #$pollCount - Status: $serverStatus, Position: $queuePosition');
+      print(
+        'DownloadService: Queue poll #$pollCount - Status: $serverStatus, Position: $queuePosition',
+      );
 
       if (serverStatus == 'queued') {
         onStatusUpdate?.call(video.videoId, 'Na fila: posição $queuePosition');
         onProgress?.call(video.videoId, 0.05, DownloadStatus.downloading);
       } else if (serverStatus == 'downloading') {
         final progress = (status['progress'] as num?)?.toDouble() ?? 0;
-        onStatusUpdate?.call(video.videoId, 'A fazer download no servidor (${progress.toStringAsFixed(0)}%)');
-        onProgress?.call(video.videoId, 0.1 + (progress / 100 * 0.4), DownloadStatus.downloading);
+        onStatusUpdate?.call(
+          video.videoId,
+          'A fazer download no servidor (${progress.toStringAsFixed(0)}%)',
+        );
+        onProgress?.call(
+          video.videoId,
+          0.1 + (progress / 100 * 0.4),
+          DownloadStatus.downloading,
+        );
       } else if (serverStatus == 'cached') {
         // Video is ready, download it
         print('DownloadService: Video is cached, downloading...');

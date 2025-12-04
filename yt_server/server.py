@@ -48,7 +48,12 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(DOWNLOADS_DIR / "cache")))
 
 # Cache settings
 MAX_CACHE_SIZE = int(os.environ.get("MAX_CACHE_SIZE", 50))  # Number of videos to cache
-DELAY_BETWEEN_DOWNLOADS = (5, 10)  # Random delay range in seconds
+
+# Anti-bot settings - critical for avoiding YouTube blocks
+NORMAL_DELAY = (3, 6)              # Normal delay between downloads (seconds)
+BOT_COOLDOWN = (30, 60)            # Cooldown after bot detection (seconds)
+MAX_FAILS_PER_VIDEO = 2            # Max attempts per video before giving up
+FAIL_MEMORY_TIME = 300             # How long to remember failed videos (5 min)
 
 # Cookies file path (optional - for bypassing bot detection)
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
@@ -75,6 +80,11 @@ download_queue = Queue()
 video_cache = OrderedDict()  # video_id -> {path, size, quality, timestamp}
 cache_lock = threading.Lock()
 last_download_time = 0
+
+# Anti-bot state
+last_bot_detection = 0
+failed_videos = {}  # video_id -> {"count": int, "last_fail": timestamp, "is_bot": bool}
+failed_lock = threading.Lock()
 
 
 def sanitize_filename(name: str, for_http_header: bool = False) -> str:
@@ -175,6 +185,10 @@ def add_to_cache(video_id: str, file_path: Path, quality: str) -> Path:
         save_cache_index()
         print(f"[CACHE] Added: {video_id} ({len(video_cache)}/{MAX_CACHE_SIZE} videos cached)")
         
+        # Clear failed status on success - video is now working!
+        with failed_lock:
+            failed_videos.pop(video_id, None)
+        
         return cache_path
 
 
@@ -219,14 +233,77 @@ def get_quality_formats(quality: str) -> list:
     return all_formats[start_index:]
 
 
+def check_video_fail_status(video_id: str) -> dict:
+    """Check if a video has failed too many times recently."""
+    with failed_lock:
+        # Clean old entries
+        now = time.time()
+        to_remove = [vid for vid, info in failed_videos.items() 
+                     if now - info["last_fail"] > FAIL_MEMORY_TIME]
+        for vid in to_remove:
+            failed_videos.pop(vid, None)
+        
+        if video_id in failed_videos:
+            info = failed_videos[video_id]
+            if info["count"] >= MAX_FAILS_PER_VIDEO:
+                wait_time = FAIL_MEMORY_TIME - (now - info["last_fail"])
+                return {
+                    "blocked": True,
+                    "reason": f"Video failed {info['count']} times. Wait {int(wait_time)}s before retry.",
+                    "wait_seconds": int(wait_time),
+                    "fail_count": info["count"]
+                }
+            return {"blocked": False, "fail_count": info["count"]}
+        
+        return {"blocked": False, "fail_count": 0}
+
+
+def record_video_failure(video_id: str, is_bot_error: bool):
+    """Record a video download failure."""
+    global last_bot_detection
+    
+    with failed_lock:
+        if video_id not in failed_videos:
+            failed_videos[video_id] = {"count": 0, "last_fail": 0, "is_bot": False}
+        
+        failed_videos[video_id]["count"] += 1
+        failed_videos[video_id]["last_fail"] = time.time()
+        
+        if is_bot_error:
+            failed_videos[video_id]["is_bot"] = True
+    
+    if is_bot_error:
+        last_bot_detection = time.time()
+        print(f"[BOT-DETECT] Recorded bot detection, activating {BOT_COOLDOWN[0]}-{BOT_COOLDOWN[1]}s cooldown")
+
+
+def is_bot_error(error: str) -> bool:
+    """Check if error is bot detection."""
+    error_lower = error.lower()
+    return any(x in error_lower for x in ["sign in", "bot", "confirm you're not"])
+
+
 def wait_for_rate_limit():
     """Wait if needed to avoid bot detection."""
-    global last_download_time
+    global last_download_time, last_bot_detection
     
+    now = time.time()
+    
+    # Check if we're in bot cooldown mode (after a bot detection)
+    if last_bot_detection > 0:
+        time_since_bot = now - last_bot_detection
+        cooldown_needed = random.uniform(*BOT_COOLDOWN)
+        
+        if time_since_bot < cooldown_needed:
+            wait_time = cooldown_needed - time_since_bot
+            print(f"[BOT-COOLDOWN] Waiting {wait_time:.1f}s after bot detection...")
+            time.sleep(wait_time)
+            last_bot_detection = 0  # Reset after cooldown complete
+    
+    # Normal rate limiting between downloads
     if last_download_time > 0:
-        elapsed = time.time() - last_download_time
-        min_delay, max_delay = DELAY_BETWEEN_DOWNLOADS
-        required_delay = random.uniform(min_delay, max_delay)
+        elapsed = now - last_download_time
+        required_delay = random.uniform(*NORMAL_DELAY)
         
         if elapsed < required_delay:
             wait_time = required_delay - elapsed
@@ -379,15 +456,17 @@ def try_download_with_fallback(video_id: str, quality: str = "1080") -> dict:
         if result["success"]:
             return result
         
-        error = result.get("error", "").lower()
+        error = result.get("error", "")
         
-        # Check for bot detection - don't retry, need cookies
-        if "sign in" in error or "bot" in error or "confirm" in error:
-            print(f"[FALLBACK] Bot detection triggered - need cookies")
+        # Check for bot detection - stop immediately, record failure
+        if is_bot_error(error):
+            print(f"[FALLBACK] Bot detection triggered - recording failure and stopping")
+            record_video_failure(video_id, is_bot_error=True)
             return result
         
         # 403/format errors - try next format
-        if "403" in error or "forbidden" in error or "format" in error:
+        error_lower = error.lower()
+        if "403" in error or "forbidden" in error_lower or "format" in error_lower:
             print(f"[FALLBACK] Format blocked, trying next...")
             for f in TEMP_DIR.glob(f"{video_id}_*"):
                 try:
@@ -396,9 +475,12 @@ def try_download_with_fallback(video_id: str, quality: str = "1080") -> dict:
                     pass
             continue
         
-        # Other errors - don't retry
+        # Other errors - record and stop
+        record_video_failure(video_id, is_bot_error=False)
         return result
     
+    # All formats failed
+    record_video_failure(video_id, is_bot_error=False)
     return {
         "success": False,
         "error": "All formats failed",
@@ -421,8 +503,11 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
     
-    def send_error_response(self, message: str, status: int = 400):
-        self.send_json_response({"error": message, "success": False}, status)
+    def send_error_response(self, message: str, status: int = 400, extra: dict = None):
+        data = {"error": message, "success": False}
+        if extra:
+            data.update(extra)
+        self.send_json_response(data, status)
     
     def check_auth(self) -> bool:
         api_key = self.headers.get("X-API-Key", "")
@@ -444,12 +529,18 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         
         if path == "/health":
+            # Include bot detection status
+            now = time.time()
+            in_cooldown = last_bot_detection > 0 and (now - last_bot_detection) < BOT_COOLDOWN[1]
+            
             self.send_json_response({
                 "status": "ok",
                 "service": "yt-download-server",
-                "version": "2.0.0",
+                "version": "2.1.0",
                 "cache_size": len(video_cache),
-                "max_cache": MAX_CACHE_SIZE
+                "max_cache": MAX_CACHE_SIZE,
+                "bot_cooldown": in_cooldown,
+                "failed_videos": len(failed_videos)
             })
             return
         
@@ -462,6 +553,8 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
             self.handle_status(params)
         elif path == "/cache":
             self.handle_cache_list()
+        elif path == "/failed":
+            self.handle_failed_list()
         elif path == "/active":
             with download_lock:
                 self.send_json_response({
@@ -470,6 +563,28 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
                 })
         else:
             self.send_error_response("Unknown endpoint", 404)
+    
+    def handle_failed_list(self):
+        """List failed videos and their status."""
+        with failed_lock:
+            now = time.time()
+            failed_info = []
+            for video_id, info in failed_videos.items():
+                wait_remaining = max(0, FAIL_MEMORY_TIME - (now - info["last_fail"]))
+                failed_info.append({
+                    "video_id": video_id,
+                    "fail_count": info["count"],
+                    "is_bot": info.get("is_bot", False),
+                    "blocked": info["count"] >= MAX_FAILS_PER_VIDEO,
+                    "wait_seconds": int(wait_remaining)
+                })
+        
+        self.send_json_response({
+            "success": True,
+            "failed_videos": failed_info,
+            "max_fails_allowed": MAX_FAILS_PER_VIDEO,
+            "fail_memory_seconds": FAIL_MEMORY_TIME
+        })
     
     def handle_cache_list(self):
         """List cached videos."""
@@ -516,6 +631,21 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
             self.stream_file(Path(cached["path"]), video_id, cached["quality"], from_cache=True)
             return
         
+        # Check if video has failed too many times
+        fail_status = check_video_fail_status(video_id)
+        if fail_status["blocked"]:
+            print(f"[BLOCKED] Video {video_id} blocked: {fail_status['reason']}")
+            self.send_error_response(
+                fail_status["reason"],
+                429,  # Too Many Requests
+                extra={
+                    "retry_after": fail_status["wait_seconds"],
+                    "fail_count": fail_status["fail_count"],
+                    "blocked": True
+                }
+            )
+            return
+        
         # Check if already downloading
         with download_lock:
             if video_id in active_downloads:
@@ -535,9 +665,20 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
             result = try_download_with_fallback(video_id, quality)
             
             if not result["success"]:
+                error = result.get("error", "Download failed")
+                
+                # Determine appropriate status code
+                if is_bot_error(error):
+                    status = 503  # Service Unavailable
+                elif "blocked" in error.lower() or "429" in error:
+                    status = 429  # Too Many Requests
+                else:
+                    status = 500
+                
                 with download_lock:
                     active_downloads.pop(video_id, None)
-                self.send_error_response(result.get("error", "Download failed"), 500)
+                    
+                self.send_error_response(error, status)
                 return
             
             # Add to cache
@@ -637,22 +778,40 @@ class YTDownloadHandler(BaseHTTPRequestHandler):
             with download_lock:
                 status = active_downloads.get(video_id)
             
-            # Also check cache
+            # Check cache and fail status
             cached = get_from_cache(video_id) if not status else None
+            fail_status = check_video_fail_status(video_id)
             
-            self.send_json_response({
+            response = {
                 "success": True,
                 "video_id": video_id,
-                "status": status or ("cached" if cached else "not_found"),
-                "cached": cached is not None
-            })
+                "cached": cached is not None,
+            }
+            
+            if status:
+                response["status"] = status
+            elif cached:
+                response["status"] = {"status": "cached", "quality": cached["quality"]}
+            elif fail_status["blocked"]:
+                response["status"] = {
+                    "status": "blocked",
+                    "reason": fail_status["reason"],
+                    "retry_after": fail_status["wait_seconds"]
+                }
+            else:
+                response["status"] = {"status": "not_found"}
+                if fail_status["fail_count"] > 0:
+                    response["previous_fails"] = fail_status["fail_count"]
+            
+            self.send_json_response(response)
         else:
             with download_lock:
                 all_status = dict(active_downloads)
             self.send_json_response({
                 "success": True,
                 "downloads": all_status,
-                "cache_size": len(video_cache)
+                "cache_size": len(video_cache),
+                "failed_count": len(failed_videos)
             })
 
 
@@ -699,7 +858,7 @@ def main():
     local_ip = get_local_ip()
     
     print("=" * 60)
-    print("  YouTube Download Server v2.0")
+    print("  YouTube Download Server v2.1 (Anti-Bot)")
     print("=" * 60)
     print(f"  URL:          http://{local_ip}:{args.port}")
     print(f"  API Key:      {args.api_key}")
@@ -707,11 +866,17 @@ def main():
     print(f"  Cache Dir:    {CACHE_DIR}")
     print(f"  Cookies:      {'Yes - ' + COOKIES_FILE if COOKIES_FILE else 'No'}")
     print("=" * 60)
+    print("\nAnti-Bot Settings:")
+    print(f"  Normal Delay:     {NORMAL_DELAY[0]}-{NORMAL_DELAY[1]}s between downloads")
+    print(f"  Bot Cooldown:     {BOT_COOLDOWN[0]}-{BOT_COOLDOWN[1]}s after detection")
+    print(f"  Max Fails/Video:  {MAX_FAILS_PER_VIDEO} (blocks for {FAIL_MEMORY_TIME}s)")
+    print("=" * 60)
     print("\nEndpoints:")
     print("  GET /health   - Health check")
     print("  GET /download - Download video")
     print("  GET /status   - Check status")
     print("  GET /cache    - List cached videos")
+    print("  GET /failed   - List failed videos")
     print("=" * 60)
     print("\nWaiting for requests...\n")
     
