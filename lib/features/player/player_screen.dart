@@ -3,7 +3,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:video_player/video_player.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart' as media_kit;
 
 import '../../data/models/models.dart';
 import '../../providers/providers.dart';
@@ -18,7 +19,10 @@ class PlayerScreen extends ConsumerStatefulWidget {
 }
 
 class _PlayerScreenState extends ConsumerState<PlayerScreen> {
-  late VideoPlayerController _controller;
+  // Media Kit player and controller
+  late final Player _player;
+  late final media_kit.VideoController _controller;
+
   bool _isInitialized = false;
   String? _error;
 
@@ -27,6 +31,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Timer? _hideControlsTimer;
   bool _isSpedUp = false;
   double _currentSpeed = 1.0;
+
+  // Buffering state
+  bool _isBuffering = false;
 
   // Available playback speeds
   static const List<double> _playbackSpeeds = [
@@ -38,12 +45,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     1.5,
     1.75,
     2.0,
+    2.5,
+    3.0,
   ];
 
   // Double tap animation
   bool _showForwardAnimation = false;
   bool _showBackwardAnimation = false;
   int _seekSeconds = 0;
+
+  // Stream subscriptions
+  final List<StreamSubscription> _subscriptions = [];
 
   @override
   void initState() {
@@ -66,18 +78,57 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
         return;
       }
 
-      _controller = VideoPlayerController.file(file);
-      await _controller.initialize();
-      _controller.addListener(_onPlayerUpdate);
+      // Create player with configuration
+      _player = Player(
+        configuration: const PlayerConfiguration(
+          bufferSize: 64 * 1024 * 1024, // 64MB buffer for smooth playback
+        ),
+      );
+
+      // Create video controller for rendering
+      _controller = media_kit.VideoController(
+        _player,
+        configuration: const media_kit.VideoControllerConfiguration(
+          enableHardwareAcceleration: true,
+        ),
+      );
+
+      // Set up stream listeners
+      _subscriptions.add(
+        _player.stream.buffering.listen((buffering) {
+          if (mounted) {
+            setState(() => _isBuffering = buffering);
+          }
+        }),
+      );
+
+      _subscriptions.add(
+        _player.stream.position.listen((position) {
+          if (position.inSeconds % 5 == 0) {
+            _savePosition(position.inSeconds);
+          }
+        }),
+      );
+
+      _subscriptions.add(
+        _player.stream.completed.listen((completed) {
+          if (completed) {
+            _onVideoCompleted();
+          }
+        }),
+      );
+
+      // Open the media file
+      await _player.open(Media(file.path));
 
       // Seek to last position if resuming
       if (widget.video.hasResumePosition) {
-        await _controller.seekTo(
+        await _player.seek(
           Duration(seconds: widget.video.lastPositionSeconds),
         );
       }
 
-      await _controller.play();
+      await _player.play();
       setState(() => _isInitialized = true);
       _startHideControlsTimer();
     } catch (e) {
@@ -85,25 +136,23 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     }
   }
 
+  void _onVideoCompleted() {
+    // Mark as watched when video ends
+    final video = ref
+        .read(syncProvider.notifier)
+        .getVideo(widget.video.videoId);
+    if (video != null && !video.watched) {
+      ref.read(syncProvider.notifier).markAsWatched(video);
+    }
+  }
+
   void _startHideControlsTimer() {
     _hideControlsTimer?.cancel();
     _hideControlsTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted && _controller.value.isPlaying) {
+      if (mounted && _player.state.playing) {
         setState(() => _showControls = false);
       }
     });
-  }
-
-  void _onPlayerUpdate() {
-    if (!_controller.value.isInitialized) return;
-
-    final position = _controller.value.position.inSeconds;
-    if (position % 5 == 0) {
-      _savePosition(position);
-    }
-
-    // Update UI
-    if (mounted) setState(() {});
   }
 
   Future<void> _savePosition(int positionSeconds) async {
@@ -118,20 +167,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _togglePlayPause() {
-    setState(() {
-      if (_controller.value.isPlaying) {
-        _controller.pause();
-      } else {
-        _controller.play();
-        _startHideControlsTimer();
-      }
-    });
+    _player.playOrPause();
+    if (_player.state.playing) {
+      _startHideControlsTimer();
+    }
+    setState(() {});
   }
 
   void _seekForward([int seconds = 10]) {
-    final newPosition = _controller.value.position + Duration(seconds: seconds);
-    final duration = _controller.value.duration;
-    _controller.seekTo(newPosition > duration ? duration : newPosition);
+    final newPosition = _player.state.position + Duration(seconds: seconds);
+    final duration = _player.state.duration;
+    _player.seek(newPosition > duration ? duration : newPosition);
 
     setState(() {
       _seekSeconds += seconds;
@@ -149,8 +195,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   void _seekBackward([int seconds = 10]) {
-    final newPosition = _controller.value.position - Duration(seconds: seconds);
-    _controller.seekTo(
+    final newPosition = _player.state.position - Duration(seconds: seconds);
+    _player.seek(
       newPosition < Duration.zero ? Duration.zero : newPosition,
     );
 
@@ -171,14 +217,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 
   void _onLongPressStart() {
     if (!_isSpedUp) {
-      _controller.setPlaybackSpeed(2.0);
+      _player.setRate(2.0);
       setState(() => _isSpedUp = true);
     }
   }
 
   void _onLongPressEnd() {
     if (_isSpedUp) {
-      _controller.setPlaybackSpeed(_currentSpeed);
+      _player.setRate(_currentSpeed);
       setState(() => _isSpedUp = false);
     }
   }
@@ -205,29 +251,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 ),
               ),
             ),
-            ...List.generate(_playbackSpeeds.length, (index) {
-              final speed = _playbackSpeeds[index];
-              final isSelected = speed == _currentSpeed;
-              return ListTile(
-                leading: isSelected
-                    ? const Icon(Icons.check, color: Colors.blue)
-                    : const SizedBox(width: 24),
-                title: Text(
-                  speed == 1.0 ? 'Normal' : '${speed}x',
-                  style: TextStyle(
-                    color: isSelected ? Colors.blue : Colors.white,
-                    fontWeight: isSelected
-                        ? FontWeight.bold
-                        : FontWeight.normal,
-                  ),
-                ),
-                onTap: () {
-                  setState(() => _currentSpeed = speed);
-                  _controller.setPlaybackSpeed(speed);
-                  Navigator.pop(context);
+            SizedBox(
+              height: 200,
+              child: ListView.builder(
+                itemCount: _playbackSpeeds.length,
+                itemBuilder: (context, index) {
+                  final speed = _playbackSpeeds[index];
+                  final isSelected = speed == _currentSpeed;
+                  return ListTile(
+                    leading: isSelected
+                        ? const Icon(Icons.check, color: Colors.blue)
+                        : const SizedBox(width: 24),
+                    title: Text(
+                      speed == 1.0 ? 'Normal' : '${speed}x',
+                      style: TextStyle(
+                        color: isSelected ? Colors.blue : Colors.white,
+                        fontWeight:
+                            isSelected ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    onTap: () {
+                      setState(() => _currentSpeed = speed);
+                      _player.setRate(speed);
+                      Navigator.pop(context);
+                    },
+                  );
                 },
-              );
-            }),
+              ),
+            ),
             const SizedBox(height: 16),
           ],
         ),
@@ -245,11 +296,19 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   @override
   void dispose() {
     _hideControlsTimer?.cancel();
-    if (_controller.value.isInitialized) {
-      _savePosition(_controller.value.position.inSeconds);
+    
+    // Save final position
+    if (_isInitialized) {
+      _savePosition(_player.state.position.inSeconds);
     }
-    _controller.removeListener(_onPlayerUpdate);
-    _controller.dispose();
+    
+    // Cancel subscriptions
+    for (final sub in _subscriptions) {
+      sub.cancel();
+    }
+    
+    // Dispose player
+    _player.dispose();
 
     // Reset orientation
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -274,7 +333,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // Video
+        // Video with media_kit - smooth GPU-accelerated rendering
         GestureDetector(
           onTap: _onTap,
           onDoubleTapDown: (details) {
@@ -285,16 +344,24 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
               _seekForward();
             }
           },
-          onDoubleTap: () {}, // Required for onDoubleTapDown to work
+          onDoubleTap: () {},
           onLongPressStart: (_) => _onLongPressStart(),
           onLongPressEnd: (_) => _onLongPressEnd(),
-          child: Center(
-            child: AspectRatio(
-              aspectRatio: _controller.value.aspectRatio,
-              child: VideoPlayer(_controller),
-            ),
+          child: media_kit.Video(
+            controller: _controller,
+            controls: media_kit.NoVideoControls, // We use our custom controls
+            fill: Colors.black,
           ),
         ),
+
+        // Buffering indicator (YouTube-style)
+        if (_isBuffering)
+          const Center(
+            child: CircularProgressIndicator(
+              color: Colors.white,
+              strokeWidth: 3,
+            ),
+          ),
 
         // Seek backward animation (left side)
         if (_showBackwardAnimation)
@@ -383,197 +450,213 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 
   Widget _buildControlsOverlay() {
-    final position = _controller.value.position;
-    final duration = _controller.value.duration;
+    return StreamBuilder<Duration>(
+      stream: _player.stream.position,
+      builder: (context, positionSnapshot) {
+        final position = positionSnapshot.data ?? Duration.zero;
+        final duration = _player.state.duration;
+        final isPlaying = _player.state.playing;
 
-    return Container(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [
-            Colors.black54,
-            Colors.transparent,
-            Colors.transparent,
-            Colors.black54,
-          ],
-          stops: const [0.0, 0.2, 0.8, 1.0],
-        ),
-      ),
-      child: SafeArea(
-        child: Column(
-          children: [
-            // Top bar
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.arrow_back, color: Colors.white),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                  Expanded(
-                    child: Text(
-                      widget.video.title,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w500,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  // Settings button (speed)
-                  IconButton(
-                    icon: const Icon(Icons.settings, color: Colors.white),
-                    onPressed: _showSpeedMenu,
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      widget.video.watched
-                          ? Icons.visibility
-                          : Icons.visibility_outlined,
-                      color: Colors.white,
-                    ),
-                    onPressed: _toggleWatched,
-                  ),
-                ],
-              ),
+        return Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Colors.black54,
+                Colors.transparent,
+                Colors.transparent,
+                Colors.black54,
+              ],
+              stops: const [0.0, 0.2, 0.8, 1.0],
             ),
-
-            const Spacer(),
-
-            // Center play/pause button
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  // Rewind 10s
-                  IconButton(
-                    iconSize: 36,
-                    icon: const Icon(Icons.replay_10, color: Colors.white),
-                    onPressed: () => _seekBackward(10),
-                  ),
-                  // Play/Pause
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      shape: BoxShape.circle,
-                    ),
-                    child: IconButton(
-                      iconSize: 48,
-                      icon: Icon(
-                        _controller.value.isPlaying
-                            ? Icons.pause
-                            : Icons.play_arrow,
-                        color: Colors.white,
+          ),
+          child: SafeArea(
+            child: Column(
+              children: [
+                // Top bar
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.arrow_back, color: Colors.white),
+                        onPressed: () => Navigator.of(context).pop(),
                       ),
-                      onPressed: _togglePlayPause,
-                    ),
-                  ),
-                  // Forward 10s
-                  IconButton(
-                    iconSize: 36,
-                    icon: const Icon(Icons.forward_10, color: Colors.white),
-                    onPressed: () => _seekForward(10),
-                  ),
-                ],
-              ),
-            ),
-
-            const Spacer(),
-
-            // Bottom controls
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  // Progress bar
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 4,
-                      thumbShape: const RoundSliderThumbShape(
-                        enabledThumbRadius: 8,
-                      ),
-                      overlayShape: const RoundSliderOverlayShape(
-                        overlayRadius: 16,
-                      ),
-                      activeTrackColor: Theme.of(context).colorScheme.primary,
-                      inactiveTrackColor: Colors.white30,
-                      thumbColor: Theme.of(context).colorScheme.primary,
-                    ),
-                    child: Slider(
-                      value: position.inMilliseconds.toDouble(),
-                      max: duration.inMilliseconds.toDouble(),
-                      onChanged: (value) {
-                        _controller.seekTo(
-                          Duration(milliseconds: value.toInt()),
-                        );
-                      },
-                    ),
-                  ),
-                  // Time display and speed indicator
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          _formatDuration(position),
+                      Expanded(
+                        child: Text(
+                          widget.video.title,
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 12,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w500,
                           ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        // Speed indicator
-                        if (_currentSpeed != 1.0)
-                          GestureDetector(
-                            onTap: _showSpeedMenu,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 2,
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.settings, color: Colors.white),
+                        onPressed: _showSpeedMenu,
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          widget.video.watched
+                              ? Icons.visibility
+                              : Icons.visibility_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: _toggleWatched,
+                      ),
+                    ],
+                  ),
+                ),
+
+                const Spacer(),
+
+                // Center play/pause button
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      IconButton(
+                        iconSize: 36,
+                        icon: const Icon(Icons.replay_10, color: Colors.white),
+                        onPressed: () => _seekBackward(10),
+                      ),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.2),
+                          shape: BoxShape.circle,
+                        ),
+                        child: IconButton(
+                          iconSize: 48,
+                          icon: Icon(
+                            isPlaying ? Icons.pause : Icons.play_arrow,
+                            color: Colors.white,
+                          ),
+                          onPressed: _togglePlayPause,
+                        ),
+                      ),
+                      IconButton(
+                        iconSize: 36,
+                        icon: const Icon(Icons.forward_10, color: Colors.white),
+                        onPressed: () => _seekForward(10),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const Spacer(),
+
+                // Bottom controls with smooth seek bar
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      // Smooth seek bar with buffer indicator
+                      StreamBuilder<Duration>(
+                        stream: _player.stream.buffer,
+                        builder: (context, bufferSnapshot) {
+                          final buffered = bufferSnapshot.data ?? Duration.zero;
+                          final bufferedFraction = duration.inMilliseconds > 0
+                              ? buffered.inMilliseconds / duration.inMilliseconds
+                              : 0.0;
+
+                          return SliderTheme(
+                            data: SliderTheme.of(context).copyWith(
+                              trackHeight: 4,
+                              thumbShape: const RoundSliderThumbShape(
+                                enabledThumbRadius: 8,
                               ),
-                              decoration: BoxDecoration(
-                                color: Colors.blue,
-                                borderRadius: BorderRadius.circular(4),
+                              overlayShape: const RoundSliderOverlayShape(
+                                overlayRadius: 16,
                               ),
-                              child: Text(
-                                '${_currentSpeed}x',
-                                style: const TextStyle(
-                                  color: Colors.white,
+                              activeTrackColor:
+                                  Theme.of(context).colorScheme.primary,
+                              inactiveTrackColor: Colors.white30,
+                              thumbColor: Theme.of(context).colorScheme.primary,
+                              secondaryActiveTrackColor: Colors.white54,
+                            ),
+                            child: Slider(
+                              value: position.inMilliseconds
+                                  .toDouble()
+                                  .clamp(0.0, duration.inMilliseconds.toDouble()),
+                              max: duration.inMilliseconds.toDouble().clamp(1.0, double.infinity),
+                              secondaryTrackValue:
+                                  (bufferedFraction * duration.inMilliseconds)
+                                      .clamp(0.0, duration.inMilliseconds.toDouble()),
+                              onChanged: (value) {
+                                _player.seek(
+                                  Duration(milliseconds: value.toInt()),
+                                );
+                              },
+                            ),
+                          );
+                        },
+                      ),
+                      // Time display
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              _formatDuration(position),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
+                            ),
+                            if (_currentSpeed != 1.0)
+                              GestureDetector(
+                                onTap: _showSpeedMenu,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.blue,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    '${_currentSpeed}x',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              )
+                            else
+                              Text(
+                                widget.video.channelName,
+                                style: TextStyle(
+                                  color: Colors.grey[400],
                                   fontSize: 12,
-                                  fontWeight: FontWeight.bold,
                                 ),
                               ),
+                            Text(
+                              _formatDuration(duration),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
                             ),
-                          )
-                        else
-                          Text(
-                            widget.video.channelName,
-                            style: TextStyle(
-                              color: Colors.grey[400],
-                              fontSize: 12,
-                            ),
-                          ),
-                        Text(
-                          _formatDuration(duration),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 12,
-                          ),
+                          ],
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
@@ -588,9 +671,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
             const SizedBox(height: 16),
             Text(
               'Error loading video',
-              style: Theme.of(
-                context,
-              ).textTheme.headlineSmall?.copyWith(color: Colors.white),
+              style: Theme.of(context)
+                  .textTheme
+                  .headlineSmall
+                  ?.copyWith(color: Colors.white),
             ),
             const SizedBox(height: 8),
             Text(
@@ -630,14 +714,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
     if (video != null) {
       if (video.watched) {
         await ref.read(syncProvider.notifier).markAsUnwatched(video);
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Marked as unwatched')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Marked as unwatched')),
+        );
       } else {
         await ref.read(syncProvider.notifier).markAsWatched(video);
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Marked as watched')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Marked as watched')),
+        );
       }
       setState(() {});
     }

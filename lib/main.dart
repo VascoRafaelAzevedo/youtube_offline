@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:media_kit/media_kit.dart';
 
 import 'data/models/models.dart';
 import 'providers/providers.dart';
@@ -10,6 +11,9 @@ import 'features/home/home_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize MediaKit for video playback
+  MediaKit.ensureInitialized();
 
   // Initialize Hive
   await Hive.initFlutter();

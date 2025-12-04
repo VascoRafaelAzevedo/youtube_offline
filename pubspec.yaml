@@ -44,9 +44,10 @@ dependencies:
   http: ^1.2.2
   path_provider: ^2.1.4
 
-  # Video player
-  video_player: ^2.9.2
-  chewie: ^1.8.5
+  # Video player - media_kit for smooth, YouTube-like experience
+  media_kit: ^1.2.3
+  media_kit_video: ^2.0.1
+  media_kit_libs_video: ^1.0.7
 
   # Local storage (Hive)
   hive: ^2.2.3

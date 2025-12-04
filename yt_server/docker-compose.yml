@@ -7,11 +7,18 @@ services:
     environment:
       - PORT=8765
       - API_KEY=${API_KEY:-offline_yt_secret_2025}
+      - MAX_CACHE_SIZE=${MAX_CACHE_SIZE:-50}
+      # Uncomment and set if you have a cookies file:
+      # - COOKIES_FILE=/cookies/cookies.txt
     volumes:
-      # Persist downloaded videos (optional - server streams to client anyway)
+      # Persist downloaded videos
       - yt_downloads:/downloads
+      # Cache directory for LRU video cache
+      - yt_cache:/cache
       # Temp directory for processing
       - yt_temp:/tmp/yt_server_temp
+      # Uncomment to mount cookies file:
+      # - ./cookies.txt:/cookies/cookies.txt:ro
     restart: unless-stopped
     # Resource limits
     deploy:
@@ -25,4 +32,6 @@ services:
 
 volumes:
   yt_downloads:
+  yt_cache:
   yt_temp:
+

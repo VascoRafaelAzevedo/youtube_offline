@@ -221,14 +221,19 @@ class SyncService {
       await video.save();
 
       try {
-        final filePath = await _downloadService.downloadVideo(
+        // Use the new retry method with status updates
+        final filePath = await _downloadService.downloadVideoWithRetry(
           video,
           onProgress: (videoId, progress, status) async {
             video.downloadProgress = progress;
             video.downloadStatus = status;
-            // Save synchronously to avoid race conditions
             await video.save();
           },
+          onStatusUpdate: (videoId, message) {
+            onStatusUpdate?.call('${video.title}: $message');
+          },
+          maxRetries: 3,
+          initialDelay: 10, // Start with 10s delay for retries
         );
 
         if (filePath != null) {
@@ -248,6 +253,11 @@ class SyncService {
 
       await video.save();
       print('SyncService: Video saved with status: ${video.downloadStatus}');
+
+      // Add a small delay between downloads to be nice to the server
+      if (i < pending.length - 1) {
+        await Future.delayed(const Duration(seconds: 2));
+      }
     }
 
     // Update sync state counts
@@ -288,13 +298,16 @@ class SyncService {
     await video.save();
 
     try {
-      final filePath = await _downloadService.downloadVideo(
+      // Use retry method for single downloads too
+      final filePath = await _downloadService.downloadVideoWithRetry(
         video,
         onProgress: (videoId, progress, status) async {
           video.downloadProgress = progress;
           video.downloadStatus = status;
           await video.save();
         },
+        maxRetries: 3,
+        initialDelay: 5,
       );
 
       if (filePath != null) {
